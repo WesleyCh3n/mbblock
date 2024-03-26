@@ -1,10 +1,13 @@
-use std::process::{Child, Stdio};
+use chrono::offset::Local;
+use chrono::DateTime;
+use std::io::Write;
+use std::process::{ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::Parser;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 #[derive(Parser, Debug)]
 #[clap(author, version)]
@@ -13,12 +16,12 @@ struct Args {
     device: Vec<String>,
     #[clap(short, long, value_parser, num_args = 1.., value_delimiter = ' ')]
     str: Vec<String>,
-    #[clap(short, long, default_value_t = 60*5)]
-    timeout: u64,
+    #[clap(short, long)]
+    timeout: Option<u64>,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let args = Args::parse();
 
     std::process::Command::new("dmesg")
@@ -42,7 +45,9 @@ async fn main() {
         'outer: while let Some(line) =
             reader.next_line().await.unwrap_or_default()
         {
-            println!("[INFO]: {}", line);
+            if line.contains("ata") {
+                println!("[INFO]: {}", line);
+            }
             for s in &args.str {
                 if line.contains(s) {
                     println!("\n{:=^80}", "");
@@ -59,39 +64,91 @@ async fn main() {
         .device
         .into_iter()
         .map(|device| {
-            std::process::Command::new("badblocks")
+            println!("start badblocks -s -v {}", device);
+            Command::new("badblocks")
                 .args(
                     format!("-s -v {}", device)
                         .split(' ')
                         .collect::<Vec<&str>>(),
                 )
+                .stdout(Stdio::null())
                 .spawn()
                 .unwrap()
         })
         .collect::<Vec<Child>>();
 
     let start = std::time::SystemTime::now();
+    let mut is_failed = false;
+    let mut success = true;
     loop {
-        if start.elapsed().unwrap().as_secs() > args.timeout {
-            println!("\nTime exceeded");
-            break;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(timeout) = args.timeout {
+            if start.elapsed().unwrap().as_secs() > timeout {
+                println!("\nTime exceeded");
+                break;
+            }
         }
         if stop.load(Ordering::Relaxed) {
             println!("\ndmesg found stop string");
+            is_failed = true;
             break;
         }
-        let mut is_all_finish = true;
+        let mut running = false;
+        success = true;
         for child in childs.iter_mut() {
-            is_all_finish = child.try_wait().ok().and_then(|r| r).is_none(); // still running
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        success = false;
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    running = true;
+                }
+                Err(e) => println!("error attempting to wait: {e}"),
+            }
         }
-        if is_all_finish {
-            println!("All badblocks finish");
+        if !success {
+            println!("\nbadblocks failed");
             break;
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        if !running {
+            println!("\nAll badblocks finish");
+            break;
+        }
+
+        let local_time: DateTime<Local> = std::time::SystemTime::now().into();
+        print!("Runing {}\r", local_time.format("%Y/%m/%d %T"));
+        std::io::stdout().flush().unwrap();
     }
+    let end = std::time::SystemTime::now();
+    let elapsed = end.duration_since(start).unwrap();
     for child in &mut childs {
-        child.kill().unwrap();
+        child.kill().await.unwrap_or_default();
     }
-    child.kill().await.unwrap();
+    child.kill().await.unwrap_or_default();
+    if !success {
+        return ExitCode::FAILURE;
+    }
+
+    let start_local: DateTime<Local> = start.into();
+    let end_local: DateTime<Local> = end.into();
+
+    println!("\n{:=^80}", "Result");
+    println!("Start: {}", start_local.format("%Y/%m/%d %T"));
+    println!("End: {}", end_local.format("%Y/%m/%d %T"));
+    println!("Elapsed: {:?}", elapsed);
+
+    if is_failed {
+        println!("badblocks failed");
+    } else {
+        println!("badblocks success");
+    }
+
+    if is_failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
